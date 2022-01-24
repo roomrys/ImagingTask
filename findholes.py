@@ -15,16 +15,6 @@ sift = cv2.SIFT_create()  # Scale Invariant Feature Transform detector
 bf = cv2.BFMatcher()  # Brute Force Matcher
 
 
-class Features(object):
-    def __init__(self):
-        self.key_points = None
-        self.descriptors = None
-        self.matches = None
-
-    def find_features(self, img):
-        self.key_points, self.descriptors = sift.detectAndCompute(img, None)
-
-
 class Image(object):
     """
     A class used to represent an image.
@@ -60,15 +50,29 @@ class Image(object):
         """gray_scale_img : gray scale version of img"""
 
         # find features and contours in image
-        self.find_features()
         self.find_contours()
+        self.find_features()
 
     def find_features(self):
         """
         A method that uses sift to detect key_points and descriptors in image.
         :return:
         """
+        if self.contours is None:
+            self.find_contours()
+        # mask = np.dstack([cv2.bitwise_not(self.binary_img)]*3)
         self.key_points, self.descriptors = sift.detectAndCompute(self.img, None)
+        self.partition_features_amongst_contours()
+
+    def partition_features_amongst_contours(self):
+        """A method to partition features amongst contours."""
+        feature_index = -1
+        for kp, des in zip(self.key_points, self.descriptors):
+            feature_index += 1
+            for contour_obj in self.contours:
+                if cv2.pointPolygonTest(contour_obj.contour, kp.pt, True):
+                    contour_obj.add_feature(kp, des, feature_index)
+                    break
 
     def find_contours(self):
         """
@@ -77,7 +81,11 @@ class Image(object):
         """
         _, self.binary_img = cv2.threshold(self.gray_scale_img, int(self.threshold_gs_slider * 255), 255, cv2.THRESH_BINARY)
         contour_list = cv2.findContours(self.binary_img, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)[-2]
-        self.contours = self.filter_contours(contour_list)
+        self.create_contour_obj(self.filter_contours(contour_list))
+
+    def create_contour_obj(self, contours_list):
+        """A method to create a list of Contour objects."""
+        self.contours = [Contour(contour, label, self) for label, contour in enumerate(contours_list)]
 
     def filter_contours(self, contour_list):
         """
@@ -100,16 +108,16 @@ class Image(object):
             self.find_contours()
         if self.contour_img is None:
             self.draw_contours()
-        label = 0
-        for contour in self.contours:
-            label += 1
-            moments = cv2.moments(contour)
+        for contour_obj in self.contours:
+            moments = cv2.moments(contour_obj.contour)
             cX = int(moments["m10"]/moments["m00"])
             cY = int(moments["m01"]/moments["m00"])
+            contour_obj.set_center((cX, cY))
             cv2.circle(self.contour_img, (cX, cY), dot_size, (0, 0, 255), -1)
-            cv2.putText(self.contour_img, str(label), (cX, cY), cv2.FONT_HERSHEY_SIMPLEX, font_size, (255, 0, 0), 2)
+            cv2.putText(self.contour_img, str(contour_obj.label), (cX, cY), cv2.FONT_HERSHEY_SIMPLEX, font_size, (255, 0, 0), 2)
+        cv2.imwrite(self.path.split('.')[0] + '_labeled.jpg', self.contour_img)
 
-    def draw_contours(self):
+    def draw_contours(self, contours_to_draw=None):
         """
         A method to (create and) draw contours on contour_img.
         :return:
@@ -117,7 +125,9 @@ class Image(object):
         if self.contours is None:
             self.find_contours()
         self.contour_img = self.img.copy()
-        cv2.drawContours(self.contour_img, self.contours, -1, (0, 255, 0), 2)
+        if contours_to_draw is None:
+            contours_to_draw = [contour_obj.contour for contour_obj in self.contours]
+        cv2.drawContours(self.contour_img, contours_to_draw, -1, (0, 255, 0), 2)
 
     def show_contours(self):
         """
@@ -161,6 +171,23 @@ class Image(object):
         for neighbor1, neighbor2 in matches:
             if neighbor1.distance < 0.75*neighbor2.distance:
                 self.matches.append(neighbor1)
+        # self.highlight_matched_contours(comparison_image)
+
+    def highlight_matched_contours(self, comparison_image):
+        """
+        A method to highlight the contours that have been matched across images.
+        :param comparison_image: Image object to find matching features in.
+        :return:
+        """
+        if self.matches is None:
+            self.match_features(comparison_image)
+        highlighted_contours = []
+        for match in self.matches:
+            for contour_obj in self.contours:
+                feature_idx_list = [ft[2] for ft in contour_obj.features]
+                if match.trainIdx in feature_idx_list:
+                    highlighted_contours.append(contour_obj.contour)
+        self.draw_contours(highlighted_contours)
 
     def show_matches(self, comparison_image):
         """
@@ -171,6 +198,7 @@ class Image(object):
         if self.matches is None:
             self.match_features(comparison_image)
         img = cv2.drawMatches(self.img, self.key_points, comparison_image.img, comparison_image.key_points, self.matches, self.img)
+        cv2.imwrite(self.path.split('.')[0] + '_matches.jpg', img)
         self.show_image(img)
 
 
@@ -179,6 +207,8 @@ class Contour(object):
     A class used to represent a contour.
     """
     def __init__(self, contour, label, parent):
+        self.features = []
+        """features : tuple of keypoints, descriptors, and index describing features found though SIFT"""
         self.center = None
         """center : center of contour"""
         self.parent = parent
@@ -189,26 +219,30 @@ class Contour(object):
         """label : label of contour"""
 
     def set_center(self, center):
+        """
+        A method to set the center of the contour as (cX, cY).
+        """
         self.center = center
+
+    def add_feature(self, key_points, descriptors, idx):
+        """
+        A method to set the key_points, descriptors, and features index of the contour.
+        """
+        self.features.append((key_points, descriptors, idx))
 
 
 if __name__=='__main__':
+    # create instance of image for square.jpg
     square = Image('square.jpg')
-    # square.show_contours()
-    square.find_moments_of_contours()
-    square.show_contours()
-    # square.show_features()
+    square.find_moments_of_contours()  # find center and label contours
+    square.show_contours()  # show labeled contours
 
+    # create instance of image for subsquare.jpg
     subsquare = Image('subsquare.jpg')
-    # subsquare.show_features()
-    subsquare.find_moments_of_contours(dot_size=5, font_size=2)
-    subsquare.show_contours()
+    subsquare.find_moments_of_contours(dot_size=5, font_size=2)  # find center and label contours
+    subsquare.show_contours()  # show labeled contours
 
-    # holeTemplate = Image('holetemplate.jpg')
-    # holeTemplate.show_features()
-    # square.show_matches(holeTemplate)
-
-    print("Number of contours found = " + str(len(subsquare.contours)))
+    # match features between square and subsquare
     subsquare.show_matches(square)
 
 """ FEATURE DETECTION/MATCHING
@@ -244,4 +278,5 @@ C. HOLES AS CLASSES WITH ATTRIBUTES
     * HOLES extend IMAGE class?
 D. USE TEMPLATE MATCHING INSTEAD OF CONTOURS
 E. USE DISTRIBUTION OF CONTOUR AREA FOR FILTERING CONTOURS
+F. HIGHLIGHT MATCHING CONTOURS IN EACH IMAGE
 """
